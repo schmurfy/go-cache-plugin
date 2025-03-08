@@ -11,7 +11,7 @@ import (
 	"errors"
 	"expvar"
 	"fmt"
-	"io/fs"
+	"io"
 	"os"
 	"path"
 	"runtime"
@@ -24,6 +24,8 @@ import (
 	"github.com/creachadair/gocache/cachedir"
 	"github.com/creachadair/taskgroup"
 	"github.com/tailscale/go-cache-plugin/lib/s3util"
+	"gocloud.dev/blob"
+	"gocloud.dev/gcerrors"
 )
 
 // S3Cache implements callbacks for a gocache.Server using an S3 bucket for
@@ -58,7 +60,7 @@ type S3Cache struct {
 
 	// S3Client is the S3 client used to read and write cache entries to the
 	// backing store. It must be non-nil.
-	S3Client *s3util.Client
+	Bucket *blob.Bucket
 
 	// KeyPrefix, if non-empty, is prepended to each key stored into S3, with an
 	// intervening slash.
@@ -106,9 +108,9 @@ func (s *S3Cache) Get(ctx context.Context, actionID string) (outputID, diskPath 
 
 	// Reaching here, either we got a cache miss or an error reading from local.
 	// Try reading the action from S3.
-	action, err := s.S3Client.GetData(ctx, s.actionKey(actionID))
+	action, err := s.Bucket.ReadAll(ctx, s.actionKey(actionID))
 	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
+		if gcerrors.Code(err) == gcerrors.NotFound {
 			s.getFaultMiss.Add(1)
 			return "", "", nil // cache miss, OK
 		}
@@ -121,7 +123,7 @@ func (s *S3Cache) Get(ctx context.Context, actionID string) (outputID, diskPath 
 		return "", "", err
 	}
 
-	object, err := s.S3Client.GetData(ctx, s.outputKey(outputID))
+	object, err := s.Bucket.ReadAll(ctx, s.outputKey(outputID))
 	if err != nil {
 		// At this point we know the action exists, so if we can't read the
 		// object report it as an error rather than a cache miss.
@@ -174,8 +176,11 @@ func (s *S3Cache) Put(ctx context.Context, obj gocache.Object) (diskPath string,
 		}
 
 		// Stage 2: Write the action record.
-		if err := s.S3Client.Put(ctx, s.actionKey(obj.ActionID),
-			strings.NewReader(fmt.Sprintf("%s %d", obj.OutputID, mtime.UnixNano()))); err != nil {
+		if err := s.Bucket.WriteAll(ctx,
+			s.actionKey(obj.ActionID),
+			[]byte(fmt.Sprintf("%s %d", obj.OutputID, mtime.UnixNano())),
+			&blob.WriterOptions{},
+		); err != nil {
 			gocache.Logf(ctx, "write action %s: %v", obj.ActionID, err)
 			return err
 		}
@@ -224,16 +229,42 @@ func (s *S3Cache) maybePutObject(ctx context.Context, outputID, diskPath, etag s
 		return time.Time{}, err
 	}
 
-	written, err := s.S3Client.PutCond(ctx, s.outputKey(outputID), etag, f)
+	key := s.outputKey(outputID)
+	needWrite := false
+
+	attrs, err := s.Bucket.Attributes(ctx, key)
 	if err != nil {
-		s.putS3Error.Add(1)
-		gocache.Logf(ctx, "[s3] put object %s: %v", outputID, err)
-		return fi.ModTime(), err
+		if gcerrors.Code(err) == gcerrors.NotFound {
+			needWrite = true
+		} else {
+			s.putS3Error.Add(1)
+			gocache.Logf(ctx, "[s3] read object attrs %s: %v", outputID, err)
+			return fi.ModTime(), err
+		}
+	} else {
+		needWrite = attrs.ETag != etag
 	}
-	if written {
+
+	if needWrite {
+		w, err := s.Bucket.NewWriter(ctx, key, &blob.WriterOptions{})
+		if err != nil {
+			s.putS3Error.Add(1)
+			gocache.Logf(ctx, "[s3] create writer %s: %v", outputID, err)
+			return fi.ModTime(), err
+		}
+		defer w.Close()
+
+		_, err = io.Copy(w, f)
+		if err != nil {
+			s.putS3Error.Add(1)
+			gocache.Logf(ctx, "[s3] copy data %s: %v", outputID, err)
+			return fi.ModTime(), err
+		}
+
 		s.putS3Found.Add(1)
 		return fi.ModTime(), nil // already present and matching
 	}
+
 	s.putS3Object.Add(1)
 	return fi.ModTime(), nil
 }

@@ -19,6 +19,7 @@ import (
 	"github.com/creachadair/atomicfile"
 	"github.com/creachadair/scheddle"
 	"github.com/creachadair/taskgroup"
+	"gocloud.dev/blob"
 )
 
 // cacheLoadLocal reads cached headers and body from the local cache.
@@ -46,7 +47,7 @@ func (s *Server) cacheStoreLocal(hash string, hdr http.Header, body []byte) erro
 
 // cacheLoadS3 reads cached headers and body from the remote S3 cache.
 func (s *Server) cacheLoadS3(ctx context.Context, hash string) ([]byte, http.Header, error) {
-	data, err := s.S3Client.GetData(ctx, s.makeKey(hash))
+	data, err := s.Bucket.ReadAll(ctx, s.makeKey(hash))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -63,13 +64,23 @@ func (s *Server) cacheStoreS3(hash string, hdr http.Header, body []byte) taskgro
 		sctx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
 		defer cancel()
 
-		if err := s.S3Client.Put(sctx, s.makeKey(hash), &buf); err != nil {
+		w, err := s.Bucket.NewWriter(sctx, s.makeKey(hash), &blob.WriterOptions{})
+		if err != nil {
 			s.logf("[s3] put %q failed: %v", hash, err)
 			s.rspPushError.Add(1)
-		} else {
-			s.rspPush.Add(1)
-			s.rspPushBytes.Add(int64(nb))
+			return err
 		}
+		defer w.Close()
+
+		_, err = io.Copy(w, &buf)
+		if err != nil {
+			s.logf("[s3] put %q failed: %v", hash, err)
+			s.rspPushError.Add(1)
+			return err
+		}
+
+		s.rspPush.Add(1)
+		s.rspPushBytes.Add(int64(nb))
 		return nil
 	}
 }

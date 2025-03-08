@@ -24,7 +24,8 @@ import (
 	"github.com/creachadair/atomicfile"
 	"github.com/creachadair/taskgroup"
 	"github.com/goproxy/goproxy"
-	"github.com/tailscale/go-cache-plugin/lib/s3util"
+	"gocloud.dev/blob"
+	"gocloud.dev/gcerrors"
 	"golang.org/x/sync/semaphore"
 )
 
@@ -55,7 +56,7 @@ type S3Cacher struct {
 
 	// S3Client is the S3 client used to read and write cache entries to the
 	// backing store. It must be non-nil.
-	S3Client *s3util.Client
+	Bucket *blob.Bucket
 
 	// KeyPrefix, if non-empty, is prepended to each key stored into S3, with an
 	// intervening slash.
@@ -158,10 +159,10 @@ func (c *S3Cacher) Get(ctx context.Context, name string) (_ io.ReadCloser, oerr 
 	}
 	defer c.sema.Release(1)
 
-	obj, err := c.S3Client.Get(ctx, c.makeKey(hash))
-	if errors.Is(err, fs.ErrNotExist) {
+	obj, err := c.Bucket.NewReader(ctx, c.makeKey(hash), &blob.ReaderOptions{})
+	if gcerrors.Code(err) == gcerrors.NotFound {
 		c.getFaultMiss.Add(1)
-		return nil, err
+		return nil, fs.ErrNotExist
 	} else if err != nil {
 		c.getFaultError.Add(1)
 		return nil, err
@@ -169,7 +170,6 @@ func (c *S3Cacher) Get(ctx context.Context, name string) (_ io.ReadCloser, oerr 
 	defer obj.Close()
 	c.getFaultHit.Add(1)
 	c.vlogf("mc F GET %q hit (%s)", name, hash)
-
 	if _, err := c.putLocal(ctx, name, path, obj); err != nil {
 		return nil, err
 	}
@@ -222,18 +222,32 @@ func (c *S3Cacher) Put(ctx context.Context, name string, data io.ReadSeeker) (oe
 	c.start(func() error {
 		defer f.Close()
 		start := time.Now()
+		defer func() {
+			c.vlogf("mc W PUT %q, err=%v %v elapsed", name, err, time.Since(start))
+		}()
 
 		// Override the context with a separate timeout in case S3 is farkakte.
 		sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 1*time.Minute)
 		defer cancel()
 
-		if err := c.S3Client.Put(sctx, c.makeKey(hash), f); err != nil {
+		key := c.makeKey(hash)
+		w, err := c.Bucket.NewWriter(sctx, key, &blob.WriterOptions{})
+		if err != nil {
 			c.putS3Error.Add(1)
 			c.logf("[s3] put %q failed: %v", name, err)
-		} else {
-			c.putS3Bytes.Add(size)
+			return err
 		}
-		c.vlogf("mc W PUT %q, err=%v %v elapsed", name, err, time.Since(start))
+		defer w.Close()
+
+		_, err = io.Copy(w, f)
+		if err != nil {
+			c.putS3Error.Add(1)
+			c.logf("[s3] put %q failed: %v", name, err)
+			return err
+		}
+
+		c.putS3Bytes.Add(size)
+
 		return err
 	})
 	return nil

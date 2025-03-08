@@ -6,13 +6,11 @@
 package main
 
 import (
-	"context"
 	"log"
 	"os"
 
 	"github.com/creachadair/command"
 	"github.com/creachadair/flax"
-	"github.com/tailscale/go-cache-plugin/lib/s3util"
 )
 
 func main() {
@@ -79,16 +77,6 @@ listening on the specified port.`,
 		},
 	}
 	command.RunOrFail(root.NewEnv(nil), os.Args[1:])
-}
-
-// getBucketRegion reports the specified region for the given bucket.
-// if the --region flag was set, that value is returned without error.
-// Otherwise, it queries the GetBucketLocation API.
-func getBucketRegion(ctx context.Context, bucket string) (string, error) {
-	if flags.S3Region != "" {
-		return flags.S3Region, nil
-	}
-	return s3util.BucketRegion(ctx, bucket)
 }
 
 // vprintf acts as log.Printf if the --verbose flag is set; otherwise it

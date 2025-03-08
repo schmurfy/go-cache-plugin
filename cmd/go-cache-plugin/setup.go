@@ -18,8 +18,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"gocloud.dev/blob"
+	_ "gocloud.dev/blob/azureblob"
+	_ "gocloud.dev/blob/fileblob"
+	_ "gocloud.dev/blob/gcsblob"
+	_ "gocloud.dev/blob/s3blob"
+
 	"github.com/creachadair/command"
 	"github.com/creachadair/gocache"
 	"github.com/creachadair/gocache/cachedir"
@@ -30,41 +34,38 @@ import (
 	"github.com/tailscale/go-cache-plugin/lib/gobuild"
 	"github.com/tailscale/go-cache-plugin/lib/modproxy"
 	"github.com/tailscale/go-cache-plugin/lib/revproxy"
-	"github.com/tailscale/go-cache-plugin/lib/s3util"
 	"tailscale.com/tsweb"
 )
 
-func initCacheServer(env *command.Env) (*gocache.Server, *s3util.Client, error) {
+func initCacheServer(env *command.Env) (*gocache.Server, *blob.Bucket, error) {
+	ctx := context.Background()
+
 	switch {
 	case flags.CacheDir == "":
 		return nil, nil, env.Usagef("you must provide a --cache-dir")
 	case flags.S3Bucket == "":
 		return nil, nil, env.Usagef("you must provide an S3 --bucket name")
 	}
-	region, err := getBucketRegion(env.Context(), flags.S3Bucket)
-	if err != nil {
-		return nil, nil, env.Usagef("you must provide an S3 --region name")
-	}
+	// region, err := getBucketRegion(env.Context(), flags.S3Bucket)
+	// if err != nil {
+	// 	return nil, nil, env.Usagef("you must provide an S3 --region name")
+	// }
 
 	dir, err := cachedir.New(flags.CacheDir)
 	if err != nil {
 		return nil, nil, fmt.Errorf("create local cache: %w", err)
 	}
 
-	cfg, err := config.LoadDefaultConfig(env.Context(), config.WithRegion(region))
+	vprintf("local cache directory: %s", flags.CacheDir)
+	vprintf("S3 cache bucket %q", flags.S3Bucket)
+	bucket, err := blob.OpenBucket(ctx, flags.S3Bucket)
 	if err != nil {
-		return nil, nil, fmt.Errorf("load AWS config: %w", err)
+		return nil, nil, fmt.Errorf("OpenBucket: %w", err)
 	}
 
-	vprintf("local cache directory: %s", flags.CacheDir)
-	vprintf("S3 cache bucket %q (%s)", flags.S3Bucket, region)
-	client := &s3util.Client{
-		Client: s3.NewFromConfig(cfg),
-		Bucket: flags.S3Bucket,
-	}
 	cache := &gobuild.S3Cache{
 		Local:             dir,
-		S3Client:          client,
+		Bucket:            bucket,
 		KeyPrefix:         flags.KeyPrefix,
 		MinUploadSize:     flags.MinUploadSize,
 		UploadConcurrency: flags.S3Concurrency,
@@ -88,13 +89,13 @@ func initCacheServer(env *command.Env) (*gocache.Server, *s3util.Client, error) 
 		LogRequests: flags.DebugLog&debugBuildCache != 0,
 	}
 	expvar.Publish("gocache_server", s.Metrics().Get("server"))
-	return s, client, nil
+	return s, bucket, nil
 }
 
 // initModProxy initializes a Go module proxy if one is enabled. If not, it
 // returns a nil handler without error. The caller must defer a call to the
 // cleanup function unless an error is reported.
-func initModProxy(env *command.Env, s3c *s3util.Client) (_ http.Handler, cleanup func(), _ error) {
+func initModProxy(env *command.Env, s3c *blob.Bucket) (_ http.Handler, cleanup func(), _ error) {
 	if !serveFlags.ModProxy {
 		return nil, noop, nil // OK, proxy is disabled
 	} else if serveFlags.HTTP == "" {
@@ -107,7 +108,7 @@ func initModProxy(env *command.Env, s3c *s3util.Client) (_ http.Handler, cleanup
 	}
 	cacher := &modproxy.S3Cacher{
 		Local:       modCachePath,
-		S3Client:    s3c,
+		Bucket:      s3c,
 		KeyPrefix:   path.Join(flags.KeyPrefix, "module"),
 		MaxTasks:    flags.S3Concurrency,
 		Logf:        vprintf,
@@ -167,7 +168,7 @@ func initModProxy(env *command.Env, s3c *s3util.Client) (_ http.Handler, cleanup
 // To the main HTTP listener, the bridge is an [http.Handler] that serves
 // requests routed to it. To the inner server, the bridge is a [net.Listener],
 // a source of client connections (with TLS terminated).
-func initRevProxy(env *command.Env, s3c *s3util.Client, g *taskgroup.Group) (http.Handler, error) {
+func initRevProxy(env *command.Env, bucket *blob.Bucket, g *taskgroup.Group) (http.Handler, error) {
 	if serveFlags.RevProxy == "" {
 		return nil, nil // OK, proxy is disabled
 	} else if serveFlags.HTTP == "" {
@@ -189,7 +190,7 @@ func initRevProxy(env *command.Env, s3c *s3util.Client, g *taskgroup.Group) (htt
 	proxy := &revproxy.Server{
 		Targets:     hosts,
 		Local:       revCachePath,
-		S3Client:    s3c,
+		Bucket:      bucket,
 		KeyPrefix:   path.Join(flags.KeyPrefix, "revproxy"),
 		Logf:        vprintf,
 		LogRequests: flags.DebugLog&debugRevProxy != 0,

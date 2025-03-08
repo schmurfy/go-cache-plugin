@@ -36,6 +36,7 @@ import (
 	"github.com/creachadair/scheddle"
 	"github.com/creachadair/taskgroup"
 	"github.com/tailscale/go-cache-plugin/lib/s3util"
+	"gocloud.dev/blob"
 )
 
 // Server is a caching reverse proxy server that caches successful responses to
@@ -79,6 +80,7 @@ type Server struct {
 	// S3Client is the S3 client used to read and write cache entries to the
 	// backing store. It must be non-nil
 	S3Client *s3util.Client
+	Bucket   *blob.Bucket
 
 	// KeyPrefix, if non-empty, is prepended to each key stored into S3, with an
 	// intervening slash.
